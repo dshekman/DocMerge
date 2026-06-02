@@ -47,6 +47,22 @@ CT_COMMENTS = (
     "application/vnd.openxmlformats-officedocument"
     ".wordprocessingml.comments+xml"
 )
+REL_TYPE_FOOTNOTES = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/"
+    "relationships/footnotes"
+)
+CT_FOOTNOTES = (
+    "application/vnd.openxmlformats-officedocument"
+    ".wordprocessingml.footnotes+xml"
+)
+REL_TYPE_ENDNOTES = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/"
+    "relationships/endnotes"
+)
+CT_ENDNOTES = (
+    "application/vnd.openxmlformats-officedocument"
+    ".wordprocessingml.endnotes+xml"
+)
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 
 
@@ -122,6 +138,96 @@ def _extract_authors(zf: zipfile.ZipFile) -> set:
             if a:
                 authors.add(a)
     return authors
+
+
+# ── Footnote / endnote helpers ───────────────────────────────────────────────
+
+def _merge_notes(out_notes_xml, c_notes_xml, c_body,
+                 note_tag: str, ref_tag: str) -> int:
+    """
+    Merge footnotes or endnotes from a colleague into the output.
+
+    note_tag  — e.g. _q("footnote")   or _q("endnote")
+    ref_tag   — e.g. _q("footnoteReference") or _q("endnoteReference")
+
+    Returns the new max note ID after merging.
+    """
+    # Special sentinel IDs used by Word (-1 = separator, 0 = continuation separator)
+    # Never copy or renumber these — they already exist in the output.
+    SENTINEL_IDS = {"-1", "0"}
+
+    # Find max normal note ID currently in output
+    max_id = 0
+    if out_notes_xml is not None:
+        for note in out_notes_xml.findall(note_tag):
+            raw = note.get(_q("id"), "")
+            if raw not in SENTINEL_IDS:
+                try:
+                    max_id = max(max_id, int(raw))
+                except ValueError:
+                    pass
+
+    # Build a map: old_id -> new_id for non-sentinel notes in colleague
+    id_map: dict[str, str] = {}
+    offset = max_id  # new IDs start from max_id + 1
+
+    for note in c_notes_xml.findall(note_tag):
+        old_id = note.get(_q("id"), "")
+        if old_id in SENTINEL_IDS:
+            continue
+        try:
+            new_id = str(int(old_id) + offset)
+        except ValueError:
+            continue
+        id_map[old_id] = new_id
+        note.set(_q("id"), new_id)
+
+    # Remap references in colleague body
+    for ref in c_body.iter(ref_tag):
+        old_id = ref.get(_q("id"), "")
+        if old_id in id_map:
+            ref.set(_q("id"), id_map[old_id])
+
+    # Append non-sentinel notes to output XML
+    for note in c_notes_xml.findall(note_tag):
+        if note.get(_q("id"), "") not in SENTINEL_IDS:
+            out_notes_xml.append(copy.deepcopy(note))
+
+    return max(int(v) for v in id_map.values()) if id_map else max_id
+
+
+def _inject_part(zf_out, zf_in, rels_xml, ct_xml,
+                 zip_path: str, rel_type: str, ct_type: str,
+                 xml_root, zip_names: set, rid_prefix: str):
+    """
+    Write a new XML part (footnotes/endnotes) that the base doc didn't have:
+    - add the file to the zip
+    - add its relationship to document.xml.rels
+    - add its content-type override to [Content_Types].xml
+    """
+    # Write the XML part
+    zf_out.writestr(zip_path, _serialize(xml_root))
+
+    # Add relationship (already written separately when iterating namelist —
+    # caller handles the rels and ct files; we just mutate the trees here)
+    existing_ids = {r.get("Id", "") for r in rels_xml}
+    new_rid = rid_prefix
+    while new_rid in existing_ids:
+        new_rid += "x"
+    etree.SubElement(
+        rels_xml, f"{{{PKG}}}Relationship",
+        {"Id": new_rid, "Type": rel_type,
+         "Target": zip_path.replace("word/", "")},
+    )
+
+    # Add content type
+    existing_parts = {e.get("PartName") for e in ct_xml}
+    part_name = "/" + zip_path
+    if part_name not in existing_parts:
+        etree.SubElement(
+            ct_xml, f"{{{CT_NS}}}Override",
+            {"PartName": part_name, "ContentType": ct_type},
+        )
 
 
 # ── Paragraph-level conflict merge ────────────────────────────────────────────
@@ -202,14 +308,19 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
     shutil.copy2(base_path, output_path)
 
     with zipfile.ZipFile(output_path, "r") as zf:
-        doc_xml      = etree.fromstring(zf.read("word/document.xml"))
-        comments_xml = _read_xml(zf, "word/comments.xml")
-        zip_names    = set(zf.namelist())
+        doc_xml       = etree.fromstring(zf.read("word/document.xml"))
+        comments_xml  = _read_xml(zf, "word/comments.xml")
+        footnotes_xml = _read_xml(zf, "word/footnotes.xml")
+        endnotes_xml  = _read_xml(zf, "word/endnotes.xml")
+        zip_names     = set(zf.namelist())
 
     body      = doc_xml.find(f".//{_q('body')}")
     out_paras = _all_paragraphs(body)
 
-    base_had_comments = comments_xml is not None
+    base_had_comments  = comments_xml  is not None
+    base_had_footnotes = footnotes_xml is not None
+    base_had_endnotes  = endnotes_xml  is not None
+
     max_rev_id = _max_id(doc_xml, _REV_TAGS)
     max_cmt_id = _max_id(comments_xml, {_q("comment")}) if comments_xml else 0
 
@@ -222,8 +333,10 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
         log_fn(f"Merging [{ci}/{len(colleague_paths)}]: {label}", "info")
         try:
             with zipfile.ZipFile(cpath, "r") as czf:
-                c_doc      = etree.fromstring(czf.read("word/document.xml"))
-                c_comments = _read_xml(czf, "word/comments.xml")
+                c_doc       = etree.fromstring(czf.read("word/document.xml"))
+                c_comments  = _read_xml(czf, "word/comments.xml")
+                c_footnotes = _read_xml(czf, "word/footnotes.xml")
+                c_endnotes  = _read_xml(czf, "word/endnotes.xml")
 
             c_body  = c_doc.find(f".//{_q('body')}")
             c_paras = _all_paragraphs(c_body)
@@ -256,6 +369,20 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                     comments_xml.append(copy.deepcopy(cmt))
                 if cmt_id_map:
                     max_cmt_id = max(int(v) for v in cmt_id_map.values())
+
+            # ── Footnotes ─────────────────────────────────────────────────────
+            if c_footnotes is not None:
+                if footnotes_xml is None:
+                    footnotes_xml = etree.Element(_q("footnotes"), nsmap={"w": W})
+                _merge_notes(footnotes_xml, c_footnotes, c_body,
+                             _q("footnote"), _q("footnoteReference"))
+
+            # ── Endnotes ──────────────────────────────────────────────────────
+            if c_endnotes is not None:
+                if endnotes_xml is None:
+                    endnotes_xml = etree.Element(_q("endnotes"), nsmap={"w": W})
+                _merge_notes(endnotes_xml, c_endnotes, c_body,
+                             _q("endnote"), _q("endnoteReference"))
 
             changed = spliced = 0
             for i, c_para in enumerate(c_paras):
@@ -299,42 +426,79 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
     os.close(tmp_fd)
 
-    inject_comments = (not base_had_comments) and (comments_xml is not None)
+    inject_comments  = (not base_had_comments)  and (comments_xml  is not None)
+    inject_footnotes = (not base_had_footnotes) and (footnotes_xml is not None)
+    inject_endnotes  = (not base_had_endnotes)  and (endnotes_xml  is not None)
+    need_rels_update = inject_comments or inject_footnotes or inject_endnotes
+    need_ct_update   = need_rels_update
 
     try:
         with zipfile.ZipFile(output_path, "r") as zf_in:
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf_out:
+
+                # Load rels + content-types once (mutated if injecting new parts)
+                rels_xml = etree.fromstring(zf_in.read("word/_rels/document.xml.rels"))
+                ct_xml   = etree.fromstring(zf_in.read("[Content_Types].xml"))
+
+                if inject_comments:
+                    existing_ids = {r.get("Id", "") for r in rels_xml}
+                    rid = "rIdComments"
+                    while rid in existing_ids: rid += "x"
+                    etree.SubElement(rels_xml, f"{{{PKG}}}Relationship",
+                                     {"Id": rid, "Type": REL_TYPE_COMMENTS, "Target": "comments.xml"})
+                    existing_parts = {e.get("PartName") for e in ct_xml}
+                    if "/word/comments.xml" not in existing_parts:
+                        etree.SubElement(ct_xml, f"{{{CT_NS}}}Override",
+                                         {"PartName": "/word/comments.xml", "ContentType": CT_COMMENTS})
+
+                if inject_footnotes:
+                    existing_ids = {r.get("Id", "") for r in rels_xml}
+                    rid = "rIdFootnotes"
+                    while rid in existing_ids: rid += "x"
+                    etree.SubElement(rels_xml, f"{{{PKG}}}Relationship",
+                                     {"Id": rid, "Type": REL_TYPE_FOOTNOTES, "Target": "footnotes.xml"})
+                    existing_parts = {e.get("PartName") for e in ct_xml}
+                    if "/word/footnotes.xml" not in existing_parts:
+                        etree.SubElement(ct_xml, f"{{{CT_NS}}}Override",
+                                         {"PartName": "/word/footnotes.xml", "ContentType": CT_FOOTNOTES})
+
+                if inject_endnotes:
+                    existing_ids = {r.get("Id", "") for r in rels_xml}
+                    rid = "rIdEndnotes"
+                    while rid in existing_ids: rid += "x"
+                    etree.SubElement(rels_xml, f"{{{PKG}}}Relationship",
+                                     {"Id": rid, "Type": REL_TYPE_ENDNOTES, "Target": "endnotes.xml"})
+                    existing_parts = {e.get("PartName") for e in ct_xml}
+                    if "/word/endnotes.xml" not in existing_parts:
+                        etree.SubElement(ct_xml, f"{{{CT_NS}}}Override",
+                                         {"PartName": "/word/endnotes.xml", "ContentType": CT_ENDNOTES})
+
                 for item in zf_in.namelist():
                     if item == "word/document.xml":
                         zf_out.writestr(item, _serialize(doc_xml))
                     elif item == "word/comments.xml":
                         data = _serialize(comments_xml) if comments_xml else zf_in.read(item)
                         zf_out.writestr(item, data)
-                    elif item == "word/_rels/document.xml.rels" and inject_comments:
-                        rels = etree.fromstring(zf_in.read(item))
-                        existing_ids = {r.get("Id", "") for r in rels}
-                        new_rid = "rIdComments"
-                        while new_rid in existing_ids:
-                            new_rid += "x"
-                        etree.SubElement(
-                            rels, f"{{{PKG}}}Relationship",
-                            {"Id": new_rid, "Type": REL_TYPE_COMMENTS, "Target": "comments.xml"},
-                        )
-                        zf_out.writestr(item, _serialize(rels))
-                    elif item == "[Content_Types].xml" and inject_comments:
-                        ct = etree.fromstring(zf_in.read(item))
-                        existing = {e.get("PartName") for e in ct}
-                        if "/word/comments.xml" not in existing:
-                            etree.SubElement(
-                                ct, f"{{{CT_NS}}}Override",
-                                {"PartName": "/word/comments.xml", "ContentType": CT_COMMENTS},
-                            )
-                        zf_out.writestr(item, _serialize(ct))
+                    elif item == "word/footnotes.xml":
+                        data = _serialize(footnotes_xml) if footnotes_xml else zf_in.read(item)
+                        zf_out.writestr(item, data)
+                    elif item == "word/endnotes.xml":
+                        data = _serialize(endnotes_xml) if endnotes_xml else zf_in.read(item)
+                        zf_out.writestr(item, data)
+                    elif item == "word/_rels/document.xml.rels":
+                        zf_out.writestr(item, _serialize(rels_xml))
+                    elif item == "[Content_Types].xml":
+                        zf_out.writestr(item, _serialize(ct_xml))
                     else:
                         zf_out.writestr(item, zf_in.read(item))
 
-                if inject_comments and "word/comments.xml" not in zip_names:
-                    zf_out.writestr("word/comments.xml", _serialize(comments_xml))
+                # Add new parts that didn't exist in the base at all
+                if inject_comments  and "word/comments.xml"  not in zip_names:
+                    zf_out.writestr("word/comments.xml",  _serialize(comments_xml))
+                if inject_footnotes and "word/footnotes.xml" not in zip_names:
+                    zf_out.writestr("word/footnotes.xml", _serialize(footnotes_xml))
+                if inject_endnotes  and "word/endnotes.xml"  not in zip_names:
+                    zf_out.writestr("word/endnotes.xml",  _serialize(endnotes_xml))
 
         shutil.move(tmp_path, output_path)
         log_fn(f"Done -> {Path(output_path).name}", "success")

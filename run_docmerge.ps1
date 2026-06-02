@@ -35,7 +35,9 @@ if (-not $python) {
 
 # Install python-docx if missing
 Write-Host "Checking dependencies..." -ForegroundColor Cyan
+$ErrorActionPreference = "Continue"
 $checkDocx = & $python -c "import docx; print('ok')" 2>&1
+$ErrorActionPreference = "Stop"
 if ($checkDocx -notmatch "ok") {
     Write-Host "Installing python-docx..." -ForegroundColor Yellow
     & $python -m pip install python-docx --quiet

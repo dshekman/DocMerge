@@ -56,7 +56,6 @@ def _q(local: str) -> str:
 
 _REV_TAGS     = {_q(t) for t in ("ins", "del", "rPrChange", "pPrChange")}
 _CMT_REF_TAGS = {_q(t) for t in ("commentRangeStart", "commentRangeEnd", "commentReference")}
-_AUTHOR_ATTR  = _q("author")
 
 
 # ── Low-level XML helpers ─────────────────────────────────────────────────────
@@ -102,11 +101,10 @@ def _offset_ids(root, tags, offset: int):
 
 
 def _set_author(root, author: str):
-    """Override w:author on every tracked-change element under root."""
     for tag in (_q("ins"), _q("del"), _q("rPrChange"), _q("pPrChange")):
         for elem in root.iter(tag):
-            if elem.get(_author_attr := _q("author")) is not None:
-                elem.set(_author_attr, author)
+            if elem.get(_q("author")) is not None:
+                elem.set(_q("author"), author)
 
 
 def _serialize(root) -> bytes:
@@ -114,7 +112,6 @@ def _serialize(root) -> bytes:
 
 
 def _extract_authors(zf: zipfile.ZipFile) -> set:
-    """Return the set of w:author values found in tracked changes inside a docx zip."""
     authors = set()
     doc = _read_xml(zf, "word/document.xml")
     if doc is None:
@@ -137,44 +134,17 @@ def _del_text(del_elem) -> str:
     return "".join(t.text or "" for t in del_elem.iter(_q("delText")))
 
 
-def _elem_base_text(elem) -> str:
-    """The 'original base' text that this element represents."""
-    if elem.tag == _q("r"):
-        return _run_text(elem)
-    if elem.tag == _q("del"):
-        return _del_text(elem)
-    return ""   # ins blocks didn't exist in the base; other elems carry no text
-
-
-def _merge_b_into_a(para_a, para_b) -> list:
-    """
-    Splice B's tracked changes into para_a, which already has A's changes.
-    Both descend from the same base paragraph.
-
-    Strategy
-    --------
-    Walk B's direct children left-to-right.  Each child is either:
-      • a base run  (w:r)        — anchor: find matching text in A's children
-      • a del block (w:del)      — anchor + potential new change
-      • an ins block (w:ins)     — new change: queue insertion after last anchor
-      • pPr / other              — skip
-
-    Returns a list of warning strings (empty when clean).
-    """
-    warnings = []
-
-    # Build A's anchor list: (element, base_text)
+def _merge_b_into_a(para_a, para_b):
     a_anchors = []
     for child in list(para_a):
-        bt = _elem_base_text(child)
-        if child.tag in (_q("r"), _q("del")):
-            a_anchors.append((child, bt))
+        if child.tag == _q("r"):
+            a_anchors.append((child, _run_text(child)))
+        elif child.tag == _q("del"):
+            a_anchors.append((child, _del_text(child)))
 
-    # Walk B's children
-    last_a_anchor: object = None   # element in para_a after which to insert next change
-    a_search_from = 0              # don't re-use anchors already consumed
-
-    insertions: list[tuple] = []   # (after_elem_or_None, new_elem)
+    last_a_anchor = None
+    a_search_from = 0
+    insertions = []
 
     for b_child in list(para_b):
         if b_child.tag == _q("pPr"):
@@ -187,70 +157,48 @@ def _merge_b_into_a(para_a, para_b) -> list:
                     last_a_anchor = a_anchors[i][0]
                     a_search_from = i + 1
                     break
-            # If not found, don't update last_a_anchor (subsequent ins will land
-            # at the last known good position).
 
         elif b_child.tag == _q("del"):
-            bt = _del_text(b_child)
+            dt = _del_text(b_child)
             matched_idx = None
             for i in range(a_search_from, len(a_anchors)):
-                if a_anchors[i][1] == bt:
+                if a_anchors[i][1] == dt:
                     matched_idx = i
                     last_a_anchor = a_anchors[i][0]
                     a_search_from = i + 1
                     break
-
-            if matched_idx is not None:
-                a_elem = a_anchors[matched_idx][0]
-                if a_elem.tag == _q("r"):
-                    # A kept it as a base run; B wants to delete it — add B's del
-                    insertions.append((last_a_anchor, copy.deepcopy(b_child)))
-                # else: A already deleted it — skip the duplicate
+            if matched_idx is not None and a_anchors[matched_idx][0].tag == _q("r"):
+                insertions.append((last_a_anchor, copy.deepcopy(b_child)))
 
         elif b_child.tag == _q("ins"):
-            # B inserts something; queue it after the last known anchor
             insertions.append((last_a_anchor, copy.deepcopy(b_child)))
 
-    # Apply all insertions
     for after_elem, new_elem in insertions:
         children = list(para_a)
         if after_elem is not None and after_elem in children:
             pos = children.index(after_elem) + 1
         else:
-            # Insert just after pPr (or at position 0)
             pos = 0
             for i, ch in enumerate(children):
                 if ch.tag == _q("pPr"):
                     pos = i + 1
                     break
         para_a.insert(pos, new_elem)
-        # Re-snapshot children so next iteration's index() call stays accurate
-        # (we inserted, so previous index values are stale — update after_elem
-        # references via object identity, which is stable)
-
-    return warnings
 
 
 # ── Core merge engine ─────────────────────────────────────────────────────────
 
 def merge_documents(base_path: str, colleague_paths: list, output_path: str,
-                    detect_format: bool, author_override: str, log_fn):
+                    detect_format: bool, author_map: dict, log_fn):
     """
-    Pure-Python tracked-changes merger.
-
-    For each colleague doc:
-      1. Extracts paragraphs that contain tracked changes.
-      2. Matches them to the output by flat paragraph index.
-      3. First colleague to touch a paragraph: replaces it wholesale.
-         Subsequent colleagues: spliced in via _merge_b_into_a().
-      4. Handles comments (renumbering + infrastructure injection).
-      5. Optionally overrides w:author on all merged changes.
+    author_map: {filepath -> author_name_string}
+                Empty string means keep the original author from the file.
     """
     base_path       = str(Path(base_path).resolve())
     output_path     = str(Path(output_path).resolve())
     colleague_paths = [str(Path(p).resolve()) for p in colleague_paths]
 
-    log_fn("Copying base document…", "info")
+    log_fn("Copying base document...", "info")
     shutil.copy2(base_path, output_path)
 
     with zipfile.ZipFile(output_path, "r") as zf:
@@ -265,11 +213,13 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
     max_rev_id = _max_id(doc_xml, _REV_TAGS)
     max_cmt_id = _max_id(comments_xml, {_q("comment")}) if comments_xml else 0
 
-    touched: dict[int, str] = {}   # para_index → colleague filename
+    touched: dict = {}
 
     for ci, cpath in enumerate(colleague_paths, 1):
-        cname = Path(cpath).name
-        log_fn(f"Merging [{ci}/{len(colleague_paths)}]: {cname}", "info")
+        cname  = Path(cpath).name
+        author = author_map.get(cpath, "").strip()
+        label  = f"{cname}" + (f"  [{author}]" if author else "")
+        log_fn(f"Merging [{ci}/{len(colleague_paths)}]: {label}", "info")
         try:
             with zipfile.ZipFile(cpath, "r") as czf:
                 c_doc      = etree.fromstring(czf.read("word/document.xml"))
@@ -278,16 +228,12 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
             c_body  = c_doc.find(f".//{_q('body')}")
             c_paras = _all_paragraphs(c_body)
 
-            # Offset revision IDs
-            rev_offset = max_rev_id + 1
-            _offset_ids(c_body, _REV_TAGS, rev_offset)
+            _offset_ids(c_body, _REV_TAGS, max_rev_id + 1)
 
-            # Author override
-            if author_override:
-                _set_author(c_body, author_override)
+            if author:
+                _set_author(c_body, author)
 
-            # ── Comments ─────────────────────────────────────────────────────
-            cmt_id_map: dict[str, str] = {}
+            cmt_id_map: dict = {}
             if c_comments is not None:
                 cmt_offset = max_cmt_id + 1
                 for cmt in c_comments.findall(_q("comment")):
@@ -295,8 +241,8 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                     new_id = str(int(old_id) + cmt_offset)
                     cmt_id_map[old_id] = new_id
                     cmt.set(_q("id"), new_id)
-                    if author_override:
-                        cmt.set(_q("author"), author_override)
+                    if author:
+                        cmt.set(_q("author"), author)
 
                 for tag in _CMT_REF_TAGS:
                     for elem in c_body.iter(tag):
@@ -311,17 +257,15 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                 if cmt_id_map:
                     max_cmt_id = max(int(v) for v in cmt_id_map.values())
 
-            # ── Paragraph merge ───────────────────────────────────────────────
             changed = spliced = 0
             for i, c_para in enumerate(c_paras):
                 if not _has_tracked_changes(c_para, detect_format):
                     continue
                 if i >= len(out_paras):
-                    log_fn(f"  ⚠  Para {i} beyond output document — skipped", "warn")
+                    log_fn(f"  Para {i} beyond output document -- skipped", "warn")
                     continue
 
                 if i not in touched:
-                    # First colleague to touch this paragraph: replace wholesale
                     out_para = out_paras[i]
                     parent   = out_para.getparent()
                     pos      = list(parent).index(out_para)
@@ -332,18 +276,14 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                     touched[i]   = cname
                     changed += 1
                 else:
-                    # Already touched: splice B's changes into A's paragraph
                     log_fn(
-                        f"  ↔  Para {i} also edited by {touched[i]} — "
-                        f"splicing both authors' changes",
+                        f"  <-> Para {i} also edited by {touched[i]} -- splicing both authors",
                         "info",
                     )
-                    warns = _merge_b_into_a(out_paras[i], c_para)
-                    for w in warns:
-                        log_fn(f"      ⚠  {w}", "warn")
+                    _merge_b_into_a(out_paras[i], c_para)
                     spliced += 1
 
-            summary = f"  ✓ {changed} paragraph(s) replaced"
+            summary = f"  + {changed} paragraph(s) replaced"
             if spliced:
                 summary += f", {spliced} paragraph(s) spliced (multi-author)"
             log_fn(summary, "success")
@@ -352,11 +292,10 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
 
         except Exception as exc:
             import traceback
-            log_fn(f"  ✗ {cname}: {exc}", "error")
+            log_fn(f"  ERROR {cname}: {exc}", "error")
             log_fn(traceback.format_exc(), "dim")
 
-    # ── Write output ──────────────────────────────────────────────────────────
-    log_fn("Writing output…", "info")
+    log_fn("Writing output...", "info")
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
     os.close(tmp_fd)
 
@@ -368,11 +307,9 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                 for item in zf_in.namelist():
                     if item == "word/document.xml":
                         zf_out.writestr(item, _serialize(doc_xml))
-
                     elif item == "word/comments.xml":
                         data = _serialize(comments_xml) if comments_xml else zf_in.read(item)
                         zf_out.writestr(item, data)
-
                     elif item == "word/_rels/document.xml.rels" and inject_comments:
                         rels = etree.fromstring(zf_in.read(item))
                         existing_ids = {r.get("Id", "") for r in rels}
@@ -384,7 +321,6 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                             {"Id": new_rid, "Type": REL_TYPE_COMMENTS, "Target": "comments.xml"},
                         )
                         zf_out.writestr(item, _serialize(rels))
-
                     elif item == "[Content_Types].xml" and inject_comments:
                         ct = etree.fromstring(zf_in.read(item))
                         existing = {e.get("PartName") for e in ct}
@@ -394,7 +330,6 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                                 {"PartName": "/word/comments.xml", "ContentType": CT_COMMENTS},
                             )
                         zf_out.writestr(item, _serialize(ct))
-
                     else:
                         zf_out.writestr(item, zf_in.read(item))
 
@@ -402,7 +337,7 @@ def merge_documents(base_path: str, colleague_paths: list, output_path: str,
                     zf_out.writestr("word/comments.xml", _serialize(comments_xml))
 
         shutil.move(tmp_path, output_path)
-        log_fn(f"Done → {Path(output_path).name}", "success")
+        log_fn(f"Done -> {Path(output_path).name}", "success")
         return True
 
     except Exception as exc:
@@ -430,14 +365,95 @@ def styled_button(parent, text, command, accent=False):
     )
 
 
-def dark_entry(parent, textvariable=None):
-    kw = dict(textvariable=textvariable) if textvariable else {}
+def dark_entry(parent, textvariable=None, width=None):
+    kw = {}
+    if textvariable:
+        kw["textvariable"] = textvariable
+    if width:
+        kw["width"] = width
     return tk.Entry(
         parent, bg=SURFACE2, fg=TEXT, insertbackground=ACCENT,
         relief="flat", bd=0, font=FONT_UI,
         highlightthickness=1, highlightbackground=BORDER,
         highlightcolor=ACCENT, **kw,
     )
+
+
+# ── Per-file author table ─────────────────────────────────────────────────────
+
+class FileAuthorTable(tk.Frame):
+    """Scrollable table: one row per colleague file with an editable Author field."""
+
+    ROW_H   = 30
+    VISIBLE = 5
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=SURFACE,
+                         highlightthickness=1, highlightbackground=BORDER, **kw)
+        self._rows: list[dict] = []
+        self._build()
+
+    def _build(self):
+        hdr = tk.Frame(self, bg=SURFACE2)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="  FILE", bg=SURFACE2, fg=TEXT_DIM,
+                 font=("Segoe UI", 8), anchor="w", width=36
+                 ).pack(side="left", padx=(4, 0), pady=5)
+        tk.Label(hdr, text="AUTHOR NAME", bg=SURFACE2, fg=TEXT_DIM,
+                 font=("Segoe UI", 8), anchor="w"
+                 ).pack(side="left", padx=(0, 4), pady=5)
+
+        body_frame = tk.Frame(self, bg=SURFACE)
+        body_frame.pack(fill="both", expand=True)
+
+        self._canvas = tk.Canvas(body_frame, bg=SURFACE, bd=0,
+                                  highlightthickness=0,
+                                  height=self.ROW_H * self.VISIBLE)
+        self._sb = tk.Scrollbar(body_frame, orient="vertical",
+                                 command=self._canvas.yview,
+                                 bg=SURFACE2, troughcolor=SURFACE, width=10)
+        self._canvas.configure(yscrollcommand=self._sb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._sb.pack(side="right", fill="y")
+
+        self._inner = tk.Frame(self._canvas, bg=SURFACE)
+        self._win_id = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(
+            self._win_id, width=e.width))
+
+    def clear(self):
+        for w in self._inner.winfo_children():
+            w.destroy()
+        self._rows.clear()
+
+    def add_file(self, path: str, detected_author: str = ""):
+        var = tk.StringVar(value=detected_author)
+        row = tk.Frame(self._inner, bg=SURFACE)
+        row.pack(fill="x")
+
+        tk.Label(row, text=f"  {Path(path).name}", bg=SURFACE, fg=TEXT,
+                 font=FONT_MONO, anchor="w", width=34
+                 ).pack(side="left", padx=(0, 6), ipady=5)
+
+        dark_entry(row, textvariable=var).pack(
+            side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+
+        tk.Frame(self._inner, bg=BORDER, height=1).pack(fill="x")
+        self._rows.append({"path": path, "var": var})
+
+    def set_author(self, path: str, author: str):
+        for r in self._rows:
+            if r["path"] == path:
+                r["var"].set(author)
+                break
+
+    def get_author_map(self) -> dict:
+        return {r["path"]: r["var"].get().strip() for r in self._rows}
+
+    def paths(self) -> list:
+        return [r["path"] for r in self._rows]
 
 
 # ── Main application ──────────────────────────────────────────────────────────
@@ -448,30 +464,25 @@ class DocMergeApp(tk.Tk):
         self.title("DocMerge")
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.minsize(640, 680)
+        self.minsize(680, 680)
 
-        self.base_var    = tk.StringVar()
-        self.folder_var  = tk.StringVar()
-        self.output_var  = tk.StringVar()
-        self.author_var  = tk.StringVar()
-        self.format_var  = tk.BooleanVar(value=False)
-        self.running     = False
-        self.colleague_files: list = []
+        self.base_var   = tk.StringVar()
+        self.folder_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+        self.format_var = tk.BooleanVar(value=False)
+        self.running    = False
 
         self._build_ui()
         self._center()
 
     def _center(self):
         self.update_idletasks()
-        w, h = 700, 720
+        w, h = 740, 740
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-    # ── UI construction ───────────────────────────────────────────────────────
-
     def _build_ui(self):
-        # Title
         header = tk.Frame(self, bg=SURFACE, pady=16)
         header.pack(fill="x")
         tk.Label(header, text="DocMerge", font=FONT_TITLE,
@@ -497,92 +508,40 @@ class DocMergeApp(tk.Tk):
         base_row.columnconfigure(0, weight=1)
         dark_entry(base_row, textvariable=self.base_var).grid(
             row=0, column=0, sticky="ew", ipady=7, padx=(0, 8))
-        styled_button(base_row, "Browse…", self._pick_base).grid(row=0, column=1)
+        styled_button(base_row, "Browse...", self._pick_base).grid(row=0, column=1)
         row += 1
 
         # Colleague folder
-        tk.Label(content, text="COLLEAGUE DOCS FOLDER  (all .docx files will be merged in)",
+        tk.Label(content, text="COLLEAGUE DOCS FOLDER",
                  bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9), anchor="w"
                  ).grid(row=row, column=0, sticky="w", pady=(0, 3))
         row += 1
         folder_row = tk.Frame(content, bg=BG)
-        folder_row.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        folder_row.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         folder_row.columnconfigure(0, weight=1)
         dark_entry(folder_row, textvariable=self.folder_var).grid(
             row=0, column=0, sticky="ew", ipady=7, padx=(0, 8))
-        styled_button(folder_row, "Browse…", self._pick_folder).grid(row=0, column=1)
+        styled_button(folder_row, "Browse...", self._pick_folder).grid(row=0, column=1)
         row += 1
 
-        # File list
-        list_frame = tk.Frame(content, bg=SURFACE, highlightthickness=1,
-                               highlightbackground=BORDER)
-        list_frame.grid(row=row, column=0, sticky="ew", pady=(0, 4))
-        self.file_list = tk.Listbox(
-            list_frame, bg=SURFACE, fg=TEXT_DIM, font=FONT_MONO,
-            relief="flat", bd=0, height=4, selectbackground=SURFACE2,
-            selectforeground=ACCENT, activestyle="none", highlightthickness=0,
-        )
-        sb = tk.Scrollbar(list_frame, orient="vertical", command=self.file_list.yview,
-                          bg=SURFACE2, troughcolor=SURFACE, width=10)
-        self.file_list.configure(yscrollcommand=sb.set)
-        self.file_list.pack(side="left", fill="both", expand=True, padx=10, pady=6)
-        sb.pack(side="right", fill="y")
-        row += 1
-
-        self.file_count_label = tk.Label(content, text="No folder selected",
-                                          bg=BG, fg=TEXT_DIM,
-                                          font=("Segoe UI", 9), anchor="w")
-        self.file_count_label.grid(row=row, column=0, sticky="w", pady=(0, 16))
-        row += 1
-
-        # ── Author name ────────────────────────────────────────────────────────
+        # File + author table
         tk.Label(
             content,
-            text="AUTHOR NAME  (overrides w:author on all merged changes — leave blank to keep original)",
+            text="FILES & AUTHORS  (pre-filled from file; edit to override the author attribution)",
             bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9), anchor="w",
         ).grid(row=row, column=0, sticky="w", pady=(0, 3))
         row += 1
-
-        author_row = tk.Frame(content, bg=BG)
-        author_row.grid(row=row, column=0, sticky="ew", pady=(0, 18))
-        author_row.columnconfigure(0, weight=1)
-
-        # ttk combobox restyled to match dark theme
-        style = ttk.Style(self)
-        style.theme_use("default")
-        style.configure(
-            "Dark.TCombobox",
-            fieldbackground=SURFACE2,
-            background=SURFACE2,
-            foreground=TEXT,
-            selectbackground=SURFACE2,
-            selectforeground=TEXT,
-            borderwidth=0,
-            arrowcolor=ACCENT,
+        self.file_table = FileAuthorTable(content)
+        self.file_table.grid(row=row, column=0, sticky="ew", pady=(0, 4))
+        row += 1
+        self.file_count_label = tk.Label(
+            content, text="No folder selected",
+            bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9), anchor="w",
         )
-        style.map(
-            "Dark.TCombobox",
-            fieldbackground=[("readonly", SURFACE2)],
-            foreground=[("readonly", TEXT)],
-        )
-
-        self.author_combo = ttk.Combobox(
-            author_row,
-            textvariable=self.author_var,
-            style="Dark.TCombobox",
-            font=FONT_UI,
-            values=[],
-        )
-        self.author_combo.grid(row=0, column=0, sticky="ew", ipady=5, padx=(0, 8))
-
-        self.author_hint = tk.Label(
-            author_row, text="scan folder first",
-            bg=BG, fg=TEXT_DIM, font=("Segoe UI", 8),
-        )
-        self.author_hint.grid(row=0, column=1)
+        self.file_count_label.grid(row=row, column=0, sticky="w", pady=(0, 18))
         row += 1
 
-        # Output path
+        # Output
         tk.Label(content, text="OUTPUT FILE",
                  bg=BG, fg=TEXT_DIM, font=("Segoe UI", 9), anchor="w"
                  ).grid(row=row, column=0, sticky="w", pady=(0, 3))
@@ -592,7 +551,7 @@ class DocMergeApp(tk.Tk):
         out_row.columnconfigure(0, weight=1)
         dark_entry(out_row, textvariable=self.output_var).grid(
             row=0, column=0, sticky="ew", ipady=7, padx=(0, 8))
-        styled_button(out_row, "Browse…", self._pick_output).grid(row=0, column=1)
+        styled_button(out_row, "Browse...", self._pick_output).grid(row=0, column=1)
         row += 1
 
         # Options
@@ -607,11 +566,10 @@ class DocMergeApp(tk.Tk):
         ).pack(side="left")
         row += 1
 
-        # Run button
         self.run_btn = styled_button(content, "  Run Merge  ", self._run, accent=True)
         self.run_btn.grid(row=row, column=0, sticky="w")
 
-        # Log panel
+        # Log
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         log_header = tk.Frame(self, bg=SURFACE, pady=6)
         log_header.pack(fill="x")
@@ -625,7 +583,7 @@ class DocMergeApp(tk.Tk):
         log_frame.pack(fill="both", expand=False)
         self.log_box = tk.Text(
             log_frame, bg="#111111", fg=TEXT_DIM, font=FONT_MONO,
-            relief="flat", bd=0, height=8, state="disabled",
+            relief="flat", bd=0, height=7, state="disabled",
             highlightthickness=0, padx=12, pady=8, wrap="word",
         )
         log_sb = tk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview,
@@ -639,8 +597,6 @@ class DocMergeApp(tk.Tk):
         self.log_box.tag_configure("success", foreground=SUCCESS)
         self.log_box.tag_configure("error",   foreground=ERROR)
         self.log_box.tag_configure("warn",    foreground=WARN)
-
-    # ── File pickers ──────────────────────────────────────────────────────────
 
     def _pick_base(self):
         p = filedialog.askopenfilename(
@@ -661,7 +617,7 @@ class DocMergeApp(tk.Tk):
 
     def _pick_output(self):
         p = filedialog.asksaveasfilename(
-            title="Save merged document as…",
+            title="Save merged document as...",
             defaultextension=".docx",
             filetypes=[("Word Documents", "*.docx")],
         )
@@ -669,45 +625,39 @@ class DocMergeApp(tk.Tk):
             self.output_var.set(p)
 
     def _refresh_file_list(self, folder: str):
-        self.file_list.delete(0, "end")
-        files = sorted(Path(folder).glob("*.docx"))
-        base = Path(self.base_var.get()).resolve() if self.base_var.get() else None
-        self.colleague_files = []
+        self.file_table.clear()
+        files   = sorted(Path(folder).glob("*.docx"))
+        base    = Path(self.base_var.get()).resolve() if self.base_var.get() else None
+        col_files = []
         for f in files:
             if base and f.resolve() == base:
                 continue
-            self.colleague_files.append(str(f))
-            self.file_list.insert("end", f"  {f.name}")
+            self.file_table.add_file(str(f))
+            col_files.append(str(f))
 
-        n = len(self.colleague_files)
+        n = len(col_files)
         self.file_count_label.config(
-            text=f"{n} colleague document{'s' if n != 1 else ''} found",
+            text=f"{n} colleague document{'s' if n != 1 else ''} found  --  author names auto-detected, edit to override",
             fg=ACCENT if n > 0 else ERROR,
         )
-
-        # Scan authors in background
-        self.author_hint.config(text="scanning…")
-        threading.Thread(target=self._scan_authors,
-                         args=(list(self.colleague_files),), daemon=True).start()
+        threading.Thread(
+            target=self._scan_authors, args=(list(col_files),), daemon=True
+        ).start()
 
     def _scan_authors(self, paths: list):
-        """Background: collect unique author names from colleague files."""
-        all_authors: set = set()
         for p in paths:
             try:
                 with zipfile.ZipFile(p, "r") as zf:
-                    all_authors |= _extract_authors(zf)
+                    authors = _extract_authors(zf)
+                if len(authors) == 1:
+                    author = next(iter(authors))
+                elif len(authors) > 1:
+                    author = ", ".join(sorted(authors))
+                else:
+                    author = ""
+                self.after(0, self.file_table.set_author, p, author)
             except Exception:
                 pass
-        self.after(0, self._populate_author_combo, sorted(all_authors))
-
-    def _populate_author_combo(self, authors: list):
-        self.author_combo["values"] = authors
-        n = len(authors)
-        hint = f"{n} author{'s' if n != 1 else ''} detected" if n else "no tracked changes found"
-        self.author_hint.config(text=hint)
-
-    # ── Log ───────────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, tag: str = "info"):
         self.log_box.configure(state="normal")
@@ -720,8 +670,6 @@ class DocMergeApp(tk.Tk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
-    # ── Run ───────────────────────────────────────────────────────────────────
-
     def _run(self):
         if self.running:
             return
@@ -730,37 +678,35 @@ class DocMergeApp(tk.Tk):
         folder = self.folder_var.get().strip()
         output = self.output_var.get().strip()
 
+        colleague_paths = self.file_table.paths()
+        author_map      = self.file_table.get_author_map()
+
         errors = []
         if not base or not Path(base).exists():
             errors.append("Base document path is invalid or missing.")
-        if not self.colleague_files:
+        if not colleague_paths:
             if folder:
                 self._refresh_file_list(folder)
-            if not self.colleague_files:
+                colleague_paths = self.file_table.paths()
+                author_map      = self.file_table.get_author_map()
+            if not colleague_paths:
                 errors.append("No colleague .docx files found in the selected folder.")
         if not output:
             errors.append("Please specify an output file path.")
         if errors:
             for e in errors:
-                self._log(f"⚠  {e}", "warn")
+                self._log(f"  {e}", "warn")
             return
 
         colleague_paths = [
-            p for p in self.colleague_files
+            p for p in colleague_paths
             if Path(p).resolve() != Path(base).resolve()
         ]
 
-        author = self.author_var.get().strip()
-
         self.running = True
-        self.run_btn.config(state="disabled", text="  Running…  ")
+        self.run_btn.config(state="disabled", text="  Running...  ")
         self._log("─" * 52, "dim")
-        self._log(
-            f"Starting merge: {len(colleague_paths)} file(s) → {Path(output).name}",
-            "info",
-        )
-        if author:
-            self._log(f"Author override: {author}", "dim")
+        self._log(f"Starting merge: {len(colleague_paths)} file(s) -> {Path(output).name}", "info")
 
         def worker():
             success = merge_documents(
@@ -768,7 +714,7 @@ class DocMergeApp(tk.Tk):
                 colleague_paths=colleague_paths,
                 output_path=output,
                 detect_format=self.format_var.get(),
-                author_override=author,
+                author_map=author_map,
                 log_fn=lambda msg, tag="info": self.after(0, self._log, msg, tag),
             )
             def done():
@@ -776,14 +722,12 @@ class DocMergeApp(tk.Tk):
                 self.run_btn.config(state="normal", text="  Run Merge  ")
                 if success:
                     self._log("─" * 52, "dim")
-                    self._log("✓  Merge complete. File saved:", "success")
+                    self._log("Merge complete. File saved:", "success")
                     self._log(f"   {output}", "dim")
             self.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = DocMergeApp()

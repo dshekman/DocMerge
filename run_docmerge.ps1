@@ -33,15 +33,9 @@ if (-not $python) {
     exit 1
 }
 
-# Install python-docx if missing
+# Ensure python-docx is installed (safe to run even if already present)
 Write-Host "Checking dependencies..." -ForegroundColor Cyan
-$ErrorActionPreference = "Continue"
-$checkDocx = & $python -c "import docx; print('ok')" 2>&1
-$ErrorActionPreference = "Stop"
-if ($checkDocx -notmatch "ok") {
-    Write-Host "Installing python-docx..." -ForegroundColor Yellow
-    & $python -m pip install python-docx --quiet
-}
+& $python -m pip install python-docx --quiet
 
 Write-Host "Launching DocMerge..." -ForegroundColor Green
 & $python $tmpFile
